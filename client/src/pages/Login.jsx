@@ -13,6 +13,7 @@ export default function Login(){
     try{
       const { data } = await api.post('/auth/login', { username, password })
       localStorage.setItem('token', data.token)
+      try { localStorage.setItem('pb.adminUser', data.user?.username || username) } catch {}
       navigate('/')
     }catch(err){
       setError(err.response?.data?.message || 'خطا در ورود')

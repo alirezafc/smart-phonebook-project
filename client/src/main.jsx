@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import './styles.css'
 import App from './pages/App.jsx'
 import Login from './pages/Login.jsx'
+import Admin from './pages/Admin.jsx'
 
 // ارسال خطاهای جاوااسکریپت مرورگر به سرور برای عیب‌یابی
 function reportClientError(payload) {
@@ -28,6 +29,7 @@ createRoot(document.getElementById('root')).render(
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/admin" element={<Admin />} />
         <Route path="/*" element={<App />} />
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>

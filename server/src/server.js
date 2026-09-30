@@ -5,10 +5,19 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import mysql from 'mysql2/promise';
 import jwt from 'jsonwebtoken';
+import AsteriskManager from 'asterisk-manager';
 import call from './routes/call.js';
 const app = express();
 const PORT = process.env.PORT || 5000;
 app.set('trust proxy', true); // IP واقعی کلاینت از X-Forwarded-For (پراکسی vite)
+
+// تنظیمات AMI برای صفحه تنظیمات پنل مدیریت
+const AMI_HOST = process.env.AMI_HOST;
+const AMI_PORT = parseInt(process.env.AMI_PORT, 10) || 5038;
+const AMI_USER = process.env.AMI_USER;
+const AMI_PASS = process.env.AMI_PASS;
+const CLICK2CALL_CONTEXT = (process.env.CLICK2CALL_CONTEXT || 'from-internal').trim();
+const OUTSIDE_PREFIX = (process.env.OUTSIDE_PREFIX ?? '9').trim();
 
 // DB pool
 const pool = mysql.createPool({
@@ -104,6 +113,97 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token, user });
 });
 
+// --- مدیریت کاربران (فقط مدیر لاگین‌شده) ---
+app.get('/api/users', auth, async (_req, res) => {
+  const [rows] = await pool.query('SELECT username, name FROM users ORDER BY username ASC');
+  res.json(rows);
+});
+app.post('/api/users', auth, async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  const name = String(req.body?.name || '').trim();
+  if (!username || !password) return res.status(400).json({ message: 'نام کاربری و رمز عبور لازم است' });
+  try {
+    await pool.query('INSERT INTO users (username, password, name) VALUES (?, ?, ?)', [username, password, name]);
+    res.status(201).json({ username });
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'این نام کاربری قبلاً ثبت شده است' });
+    console.error('user insert:', e.message);
+    res.status(500).json({ message: 'خطای دیتابیس' });
+  }
+});
+app.put('/api/users/:username', auth, async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  const password = String(req.body?.password || '');
+  const name = String(req.body?.name || '').trim();
+  if (!username) return res.status(400).json({ message: 'نام کاربری نامعتبر است' });
+  const sets = [];
+  const params = [];
+  if (password) { sets.push('password = ?'); params.push(password); }
+  if (name) { sets.push('name = ?'); params.push(name); }
+  if (!sets.length) return res.status(400).json({ message: 'مقداری برای تغییر ندارد' });
+  params.push(username);
+  await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE username = ?`, params);
+  res.json({ updated: true });
+});
+app.delete('/api/users/:username', auth, async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  if (!username) return res.status(400).json({ message: 'نام کاربری نامعتبر است' });
+  if (req.user?.username === username) {
+    return res.status(400).json({ message: 'امکان حذف کاربر لاگین‌شده وجود ندارد' });
+  }
+  const [count] = await pool.query('SELECT COUNT(*) AS c FROM users');
+  if (count[0].c <= 1) return res.status(400).json({ message: 'آخرین کاربر قابل حذف نیست' });
+  await pool.query('DELETE FROM users WHERE username = ?', [username]);
+  res.json({ deleted: username });
+});
+
+// --- مدیریت شماره‌ها/داخلی‌ها (فقط مدیر لاگین‌شده) ---
+const NUMBER_FIELDS = ['name', 'lastname', 'samat', 'intel', 'outtel', 'mobile', 'vahed'];
+function pickNumberFields(body) {
+  const out = {};
+  for (const f of NUMBER_FIELDS) {
+    const v = body?.[f];
+    if (v !== undefined && v !== null) out[f] = String(v).trim();
+    else out[f] = '';
+  }
+  return out;
+}
+app.post('/api/numbers', auth, async (req, res) => {
+  const n = pickNumberFields(req.body);
+  if (!n.name && !n.lastname) return res.status(400).json({ message: 'نام یا نام خانوادگی لازم است' });
+  if (n.intel) {
+    const [dup] = await pool.query('SELECT id FROM numbers WHERE TRIM(intel) = ?', [n.intel]);
+    if (dup.length) return res.status(409).json({ message: 'این شماره داخلی قبلاً ثبت شده است' });
+  }
+  const [r] = await pool.query(
+    'INSERT INTO numbers (name, lastname, samat, intel, outtel, mobile, vahed) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [n.name, n.lastname, n.samat, n.intel, n.outtel, n.mobile, n.vahed]
+  );
+  res.status(201).json({ id: r.insertId });
+});
+app.put('/api/numbers/:id', auth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'شناسه نامعتبر است' });
+  const n = pickNumberFields(req.body);
+  if (!n.name && !n.lastname) return res.status(400).json({ message: 'نام یا نام خانوادگی لازم است' });
+  if (n.intel) {
+    const [dup] = await pool.query('SELECT id FROM numbers WHERE TRIM(intel) = ? AND id <> ?', [n.intel, id]);
+    if (dup.length) return res.status(409).json({ message: 'این شماره داخلی قبلاً ثبت شده است' });
+  }
+  await pool.query(
+    'UPDATE numbers SET name=?, lastname=?, samat=?, intel=?, outtel=?, mobile=?, vahed=? WHERE id=?',
+    [n.name, n.lastname, n.samat, n.intel, n.outtel, n.mobile, n.vahed, id]
+  );
+  res.json({ updated: true });
+});
+app.delete('/api/numbers/:id', auth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'شناسه نامعتبر است' });
+  await pool.query('DELETE FROM numbers WHERE id = ?', [id]);
+  res.json({ deleted: true });
+});
+
 // Numbers listing with full-text-ish search + pagination + optional unit filter
 
 // تبدیل ارقام فارسی/عربی به انگلیسی و حذف جداکننده‌های رایج در تایپ شماره
@@ -179,11 +279,84 @@ app.get('/api/phone-models', async (_req, res) => {
   }
 });
 
+// --- مدیریت مدل تلفن‌ها (پنل مدیریت) ---
+app.get('/api/phone-models/all', auth, async (_req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM phone_models ORDER BY brand ASC, model ASC"
+  );
+  res.json(rows);
+});
+app.post('/api/phone-models', auth, async (req, res) => {
+  const brand = String(req.body?.brand || '').trim();
+  const model = String(req.body?.model || '').trim();
+  const profile = ['both', 'callinfo', 'alertinfo', 'none'].includes(req.body?.auto_answer_profile)
+    ? req.body.auto_answer_profile : 'none';
+  if (!brand || !model) return res.status(400).json({ message: 'برند و مدل لازم است' });
+  try {
+    const [r] = await pool.query(
+      'INSERT INTO phone_models (brand, model, auto_answer_profile) VALUES (?, ?, ?)',
+      [brand, model, profile]
+    );
+    res.status(201).json({ id: r.insertId });
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'این برند/مدل قبلاً ثبت شده است' });
+    console.error('phone-model insert:', e.message);
+    res.status(500).json({ message: 'خطای دیتابیس' });
+  }
+});
+app.put('/api/phone-models/:id', auth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'شناسه مدل نامعتبر است' });
+  const sets = [];
+  const params = [];
+  const profile = req.body?.auto_answer_profile;
+  if (profile !== undefined) {
+    if (!['both', 'callinfo', 'alertinfo', 'none'].includes(profile)) {
+      return res.status(400).json({ message: 'پروفایل نامعتبر است' });
+    }
+    sets.push('auto_answer_profile = ?'); params.push(profile);
+  }
+  if (req.body?.is_active !== undefined) {
+    sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0);
+  }
+  if (!sets.length) return res.status(400).json({ message: 'مقداری برای تغییر ندارد' });
+  params.push(id);
+  await pool.query(`UPDATE phone_models SET ${sets.join(', ')} WHERE id = ?`, params);
+  res.json({ updated: true });
+});
+
+// --- وضعیت اتصال به ایزابل (پنل مدیریت) ---
+app.get('/api/settings/ami-status', auth, async (_req, res) => {
+  const base = { host: AMI_HOST, port: AMI_PORT, user: AMI_USER, context: CLICK2CALL_CONTEXT, outsidePrefix: OUTSIDE_PREFIX };
+  try {
+    const ami = new AsteriskManager(AMI_PORT, AMI_HOST, AMI_USER, AMI_PASS, true);
+    const withTimeout = (fn) => new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('تلاش به اتصال AMI قطع شد (متقاضی)')), 6000);
+      ami.on('error', e => { clearTimeout(t); reject(e); });
+      fn((err, evt) => { clearTimeout(t); err ? reject(err) : resolve(evt); });
+    });
+    await withTimeout(cb => ami.action({ Action: 'Ping' }, cb));
+    const core = await withTimeout(cb => ami.action({ Action: 'Command', Command: 'core show uptime' }, cb));
+    const uptime = [core?.output, core?.output1, core?.output2].filter(Boolean).join('\n');
+    try { ami.disconnect(); } catch {}
+    res.json({ connected: true, ...base, pbxUptime: uptime });
+  } catch (e) {
+    res.json({ connected: false, ...base, error: String(e.message || 'اتصال برقرار نشد') });
+  }
+});
+
 app.use('/api/call', call(pool));
 
 // --- مدیریت قفل داخلی‌ها (فقط مدیر لاگین‌شده) ---
 app.get('/api/claims', auth, async (req, res) => {
-  const [rows] = await pool.query('SELECT extension, computer_ip, created_at, updated_at FROM extension_claims ORDER BY extension ASC');
+  const [rows] = await pool.query(`
+    SELECT ec.extension, ec.computer_ip, ec.created_at, ec.updated_at,
+           ec.model_id, pm.brand, pm.model, pm.auto_answer_profile AS profile,
+           CONCAT_WS(' ', n.name, n.lastname) AS owner
+    FROM extension_claims ec
+    LEFT JOIN phone_models pm ON ec.model_id = pm.id
+    LEFT JOIN numbers n ON TRIM(n.intel) = ec.extension
+    ORDER BY ec.extension ASC`);
   res.json(rows);
 });
 app.delete('/api/claims/:ext', auth, async (req, res) => {
@@ -191,6 +364,21 @@ app.delete('/api/claims/:ext', auth, async (req, res) => {
   if (!ext) return res.status(400).json({ message: 'داخلی نامعتبر است' });
   await pool.query('DELETE FROM extension_claims WHERE extension = ?', [ext]);
   res.json({ released: true });
+});
+// تغییر مدل تلفن ثبت‌شده برای یک داخلی (بدون نیاز به آزادسازی و تأیید مجدد)
+app.put('/api/claims/:ext/model', auth, async (req, res) => {
+  const ext = String(req.params.ext || '').replace(/\D/g, '');
+  const modelId = req.body?.modelId == null ? null : Number(req.body.modelId);
+  if (!ext) return res.status(400).json({ message: 'داخلی نامعتبر است' });
+  if (modelId != null && !Number.isInteger(modelId)) {
+    return res.status(400).json({ message: 'مدل تلفن نامعتبر است' });
+  }
+  if (modelId != null) {
+    const [m] = await pool.query('SELECT id FROM phone_models WHERE id = ?', [modelId]);
+    if (!m.length) return res.status(400).json({ message: 'مدل موردنظر یافت نشد' });
+  }
+  await pool.query('UPDATE extension_claims SET model_id = ? WHERE extension = ?', [modelId, ext]);
+  res.json({ updated: true });
 });
 
 // لاگ خطاها/رویدادهای سمت مرورگر برای عیب‌یابی

@@ -1,4 +1,6 @@
-export default function Header({ status, ext, onOpenSettings, onLogout }){
+import { Link } from 'react-router-dom'
+
+export default function Header({ status, ext, onOpenSettings, onLogout, showAdmin = false }){
   return (
     <div className="bg-slate-900 text-white">
       <div className="max-w-6xl mx-auto p-4 flex items-center justify-between gap-3">
@@ -16,6 +18,9 @@ export default function Header({ status, ext, onOpenSettings, onLogout }){
             <button onClick={onOpenSettings} className="bg-amber-500 hover:bg-amber-600 px-3 py-1 rounded-lg text-sm font-medium">
               {status === 'none' ? 'تنظیم داخلی (اختیاری)' : 'تنظیم شماره داخلی'}
             </button>
+          )}
+          {showAdmin && (
+            <Link to="/admin" className="bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg">مدیریت</Link>
           )}
           <button onClick={onLogout} className="bg-white/10 hover:bg-white/20 px-3 py-1 rounded-lg">خروج</button>
         </div>

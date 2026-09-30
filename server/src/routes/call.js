@@ -12,26 +12,31 @@ export default function callRouter(pool) {
   const AMI_PASS = process.env.AMI_PASS;
   const CHANNEL_TECH = (process.env.AMI_CHANNEL_TECH || 'SIP').trim();   // SIP یا PJSIP
   const OUTSIDE_PREFIX = (process.env.OUTSIDE_PREFIX ?? '9').trim();     // پیش‌شماره خط بیرونی
+  const CLICK2CALL_CONTEXT = (process.env.CLICK2CALL_CONTEXT || 'from-internal').trim(); // کانتکست مقصد
 
   const EXT_RE = /^\d{2,6}$/;
   const TARGET_RE = /^\d{3,15}$/;
   const AUTO_ANSWER = process.env.AUTO_ANSWER !== '0'; // پیش‌فرض روشن
   const VERIFY_TTL_MS = 30000; // کل زمان تماس تأیید (شمارش ۳۰ ثانیه‌ای)
 
-  // هدرهای Auto-Answer برای Fanvil/ZTE/Grandstream — گوشی خودکار جواب دهد روی بلندگو
-  const AUTOANSWER_VARS = {
-    '__SIPADDHEADER':  'Call-Info: <sip:${EXTEN}@${DOMAIN}>;answer-after=0',
-    '__SIPADDHEADER1': 'Alert-Info: <sip:${EXTEN}@${DOMAIN}>;info=alert-autoanswer',
-    '__SIPADDHEADER2': 'Require: replaces'
-  };
-
-  // جایگزینی متغیرها در هدرها
-  function resolveAutoAnswerVars(ext) {
-    const domain = AMI_HOST; // دامنه/آی‌پی سرور
+  // هدرهای Auto-Answer بر اساس پروفایل مدل تلفن — فقط برای گوشی تماس‌گیرنده.
+  // بدون پیشوند `__` (else به کانال مقصد هم ارث می‌رود و تلفن طرف مقابل خودکار جواب می‌دهد!)
+  // پروفایل‌ها: both = هر دو هدر، callinfo = فقط Call-Info، alertinfo = فقط Alert-Info، none = بدون هدر
+  function buildAutoAnswerVars(profile, ext) {
+    const domain = AMI_HOST;
+    const subs = { EXTEN: ext, DOMAIN: domain };
+    const fill = (v) => String(v).replace(/\$\{EXTEN\}/g, subs.EXTEN).replace(/\$\{DOMAIN\}/g, subs.DOMAIN);
     const vars = {};
-    for (const [k, v] of Object.entries(AUTOANSWER_VARS)) {
-      vars[k] = v.replace(/\$\{EXTEN\}/g, ext).replace(/\$\{DOMAIN\}/g, domain);
+    const p = String(profile || 'none').toLowerCase();
+    if (p === 'both') {
+      vars['SIPADDHEADER'] = fill('Call-Info: <sip:${EXTEN}@${DOMAIN}>;answer-after=0');
+      vars['SIPADDHEADER1'] = fill('Alert-Info: <sip:${EXTEN}@${DOMAIN}>;info=alert-autoanswer');
+    } else if (p === 'callinfo') {
+      vars['SIPADDHEADER'] = fill('Call-Info: <sip:${EXTEN}@${DOMAIN}>;answer-after=0');
+    } else if (p === 'alertinfo') {
+      vars['SIPADDHEADER'] = fill('Alert-Info: <sip:${EXTEN}@${DOMAIN}>;info=alert-autoanswer');
     }
+    // 'none' → بدون هدر → گوشی فقط زنگ می‌خورد و دستی جواب داده می‌شود
     return vars;
   }
 
@@ -54,23 +59,6 @@ export default function callRouter(pool) {
     // موبایل بدون صفر ابتدایی (مثل 9133916477) باید مثل شماره‌گیری دستی، با صفر بیرون برود: 9 + 0913...
     if (/^9\d{9}$/.test(targetNumber)) return OUTSIDE_PREFIX + '0' + targetNumber;
     return OUTSIDE_PREFIX + targetNumber;
-  }
-
-  function originateAndLog(ami, action, cb) {
-    const onEvent = (evt) => {
-      try {
-        const s = JSON.stringify(evt);
-        if (/originateresponse/i.test(s)) console.log('OriginateResponse:', s);
-        else if (/"event":"hangup"/i.test(s)) console.log('Hangup:', s);
-      } catch {}
-    };
-    ami.on('managerevent', onEvent);
-    ami.action(action, (err, resAMI) => {
-      setTimeout(() => {
-        try { ami.removeListener('managerevent', onEvent); ami.disconnect(); } catch {}
-      }, VERIFY_TTL_MS + 10000);
-      cb(err, resAMI);
-    });
   }
 
   // اگر داخلی قبلاً توسط رایانهٔ دیگری ثبت شده، پیام خطا برمی‌گرداند؛ وگرنه null
@@ -105,6 +93,7 @@ export default function callRouter(pool) {
 
   router.post('/verify/start', async (req, res) => {
     const callerExtension = String(req.body?.callerExtension ?? '').replace(/\D/g, '');
+    const modelId = Number.isInteger(req.body?.modelId) ? req.body.modelId : null;
     if (!EXT_RE.test(callerExtension)) {
       return res.status(400).json({ verified: false, reason: 'شماره داخلی نامعتبر است' });
     }
@@ -119,7 +108,7 @@ export default function callRouter(pool) {
 
       const ami = await openAmi();
       const attempt = {
-        ext: callerExtension, ip, code,
+        ext: callerExtension, ip, code, modelId,
         status: 'pending', reason: '', digits: '',
         origChannel: '', ami, killTimer: null
       };
@@ -161,10 +150,10 @@ export default function callRouter(pool) {
               console.log(`Verify ${id} [${callerExtension}]: digit received -> ${attempt.digits}`);
               if (attempt.digits === attempt.code) {
                 finish('success', '');
-                // ثبت/نوشتن قفل این داخلی برای همین رایانه
+                // ثبت/نوشتن قفل این داخلی برای همین رایانه + مدل تلفن انتخاب‌شده
                 pool.query(
-                  'INSERT INTO extension_claims (extension, computer_ip) VALUES (?, ?) ON DUPLICATE KEY UPDATE computer_ip = VALUES(computer_ip)',
-                  [attempt.ext, attempt.ip]
+                  'INSERT INTO extension_claims (extension, computer_ip, model_id) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE computer_ip = VALUES(computer_ip), model_id = VALUES(model_id)',
+                  [attempt.ext, attempt.ip, attempt.modelId]
                 ).catch(e => console.error('claim insert error:', e.message));
                 hangupOrig();
               } else if (attempt.digits.length >= attempt.code.length) {
@@ -237,6 +226,21 @@ export default function callRouter(pool) {
 
   /* ---------- تماس عادی ---------- */
 
+  // نشست‌های تماس برای اطلاع از پاسخ‌گویی مقصد (برای بستن خودکار مدال)
+  const callSessions = new Map(); // callId -> session
+
+  function genCallId(){
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  function cleanupCallSession(callId){
+    const s = callSessions.get(callId);
+    if (!s) return;
+    try { s.ami && s.ami.disconnect(); } catch {}
+    if (s.killTimer) clearTimeout(s.killTimer);
+    callSessions.delete(callId);
+  }
+
   router.post('/', async (req, res) => {
     const callerExtension = String(req.body?.callerExtension ?? '').replace(/\D/g, '');
     const targetNumber = String(req.body?.targetNumber ?? '').replace(/\D/g, '');
@@ -253,32 +257,109 @@ export default function callRouter(pool) {
       if (blocked) return res.status(403).json({ success: false, error: blocked });
 
       const exten = buildTarget(targetNumber);
-      const ami = await openAmi();
 
-      originateAndLog(ami, {
+      // پروفایل auto-answer بر اساس مدل تلفنِ تماس‌گیرنده
+      let autoProfile = 'none';
+      try {
+        const [mrows] = await pool.query(
+          `SELECT pm.auto_answer_profile AS profile
+           FROM extension_claims ec
+           LEFT JOIN phone_models pm ON ec.model_id = pm.id
+           WHERE ec.extension = ?`,
+          [callerExtension]
+        );
+        autoProfile = mrows[0]?.profile || 'none';
+      } catch (e) {
+        console.error('call model lookup error:', e.message);
+      }
+
+      const callId = genCallId();
+      const session = {
+        callId, status: 'ringing', exten,
+        ip: normalizeIp(req.ip), ami: null, killTimer: null, origChannel: ''
+      };
+      callSessions.set(callId, session);
+
+      const ami = await openAmi();
+      session.ami = ami;
+
+      // رویداد Dial با DialStatus=ANSWER = لحظه‌ای که مقصد گوشی را برمی‌دارد
+      const onEvt = (evt) => {
+        try {
+          const evName = String(evt.event || '');
+          if (/^newchannel$/i.test(evName)) {
+            if (!session.origChannel && String(evt.calleridnum || '') === callerExtension) {
+              session.origChannel = String(evt.channel || '');
+            }
+          } else if (/^dial$/i.test(evName) && /^end$/i.test(String(evt.subevent || '')) && /^answer$/i.test(String(evt.dialstatus || ''))) {
+            if (session.status === 'ringing') {
+              session.status = 'connected';
+              console.log(`Call ${callId} [${callerExtension}->${exten}]: answered`);
+            }
+          } else if (/^hangup$/i.test(evName)) {
+            if (session.status !== 'connected') session.status = 'ended';
+          }
+        } catch {}
+      };
+      ami.on('managerevent', onEvt);
+
+      ami.action({
         Action: 'Originate',
         Channel: `${CHANNEL_TECH}/${callerExtension}`,
-        Context: 'from-internal',
+        Context: CLICK2CALL_CONTEXT,
         Exten: exten,
         Priority: 1,
         CallerID: `Click2Call <${callerExtension}>`,
         Variable: {
           'CALLERID(all)': `"Click2Call ${callerExtension}" <${callerExtension}>`,
-          ...(AUTO_ANSWER ? resolveAutoAnswerVars(callerExtension) : {})
+          ...(AUTO_ANSWER ? buildAutoAnswerVars(autoProfile, callerExtension) : {})
         },
         Timeout: 30000,
         Async: 'true'
       }, function(err, resAMI) {
         if (err) {
-          console.error('AMI Error:', err);
+          console.error('AMI Call Error:', err);
+          session.status = 'failed';
           return res.status(500).json({ success: false, error: err.message || 'خطای AMI' });
         }
-        return res.json({ success: true, dialed: exten, response: resAMI });
+        return res.json({ success: true, dialed: exten, callId });
       });
+
+      // پاک‌سازی نهایی نشست (حتی اگر کسی بازی نده)
+      session.killTimer = setTimeout(() => cleanupCallSession(callId), 10 * 60 * 1000);
+      session.cleanupAfter = (ms) => {
+        if (session.killTimer) clearTimeout(session.killTimer);
+        session.killTimer = setTimeout(() => cleanupCallSession(callId), ms);
+      };
 
     } catch (error) {
       console.error('Error:', error);
       return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // وضعیت تماس برای بستن خودکار مدال در سمت مرورگر
+  router.get('/status/:callId', (req, res) => {
+    const s = callSessions.get(String(req.params.callId || ''));
+    if (!s) return res.json({ status: 'unknown' });
+    if (s.ip !== normalizeIp(req.ip)) return res.status(403).json({ status: 'forbidden' });
+    res.json({ status: s.status, dialed: s.exten });
+    if (s.status === 'connected' || s.status === 'failed' || s.status === 'ended') {
+      s.cleanupAfter && s.cleanupAfter(15000);
+    }
+  });
+
+  // لغو/قطع تماس توسط کاربر
+  router.post('/hangup', (req, res) => {
+    const callId = String(req.body?.callId || '');
+    const s = callSessions.get(callId);
+    if (!s) return res.json({ success: false });
+    if (!s.origChannel) return res.json({ success: false });
+    try {
+      s.ami.action({ Action: 'Hangup', Channel: s.origChannel }, () => {});
+      res.json({ success: true });
+    } catch (e) {
+      res.json({ success: false });
     }
   });
 

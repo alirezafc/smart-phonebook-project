@@ -11,6 +11,8 @@ export default function ExtensionDialog({ onClose, onSaved, currentExt = '', can
   const [countdown, setCountdown] = useState(0)
   const [digitsGot, setDigitsGot] = useState(0)
   const [error, setError] = useState('')
+  const [models, setModels] = useState([])
+  const [modelId, setModelId] = useState('')
   const debounceRef = useRef(null)
   const pollRef = useRef(null)
   const tickRef = useRef(null)
@@ -45,6 +47,13 @@ export default function ExtensionDialog({ onClose, onSaved, currentExt = '', can
   }
 
   useEffect(() => () => stopTimers(), [])
+
+  // بارگذاری لیست مدل‌های تلفن برای دراپ‌داون
+  useEffect(() => {
+    api.get('/phone-models', { timeout: 8000 })
+      .then(res => setModels(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setModels([]))
+  }, [])
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
@@ -83,7 +92,7 @@ export default function ExtensionDialog({ onClose, onSaved, currentExt = '', can
     if (!/^\d{2,6}$/.test(ext)) { setError('شماره داخلی را وارد کنید'); return }
     setError('')
     try{
-      const { data } = await api.post('/call/verify/start', { callerExtension: ext }, { timeout: 15000 })
+      const { data } = await api.post('/call/verify/start', { callerExtension: ext, modelId: modelId ? Number(modelId) : null }, { timeout: 15000 })
       if (data.attemptId && data.code) {
         setCode(data.code)
         setDigitsGot(0)
@@ -231,6 +240,23 @@ export default function ExtensionDialog({ onClose, onSaved, currentExt = '', can
                     ))}
                   </div>
                 )}
+
+                <label className="block mb-3 text-sm">
+                  مدل تلفن شما
+                  <select
+                    value={modelId}
+                    onChange={e => setModelId(e.target.value)}
+                    className="w-full border rounded-xl p-2 mt-1 bg-white"
+                  >
+                    <option value="">مدل تلفن خود را انتخاب کنید</option>
+                    {models.map(m => (
+                      <option key={m.id} value={m.id}>{m.brand} — {m.model}</option>
+                    ))}
+                  </select>
+                  <span className="block text-xs text-slate-400 mt-1">
+                    اگر مدل تلفن‌تان نیست، همان «شماره داخلی» را تأیید کنید؛ جواب‌گویی خودکار برایتان خاموش می‌ماند.
+                  </span>
+                </label>
               </>
             )}
 

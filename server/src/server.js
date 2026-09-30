@@ -25,9 +25,42 @@ const pool = mysql.createPool({
 pool.query(`CREATE TABLE IF NOT EXISTS extension_claims (
   extension VARCHAR(20) PRIMARY KEY,
   computer_ip VARCHAR(64) NOT NULL DEFAULT '',
+  model_id INT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).catch(e => console.error('claims table init:', e.message));
+
+// اگر جدول extension_claims قبلاً ساخته شده ولی ستون model_id ندارد، آن را اضافه کن
+pool.query(
+  `SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'extension_claims' AND COLUMN_NAME = 'model_id'`
+).then(([r]) => {
+  if (!r || !r[0] || Number(r[0].c) === 0) {
+    return pool.query(`ALTER TABLE extension_claims ADD COLUMN model_id INT NULL`).catch(e => console.error('claims model_id migration:', e.message));
+  }
+}).catch(e => console.error('claims schema check:', e.message));
+
+// مدل تلفن‌ها: فقط لیست برند/مدل + پروفایل auto-answer
+pool.query(`CREATE TABLE IF NOT EXISTS phone_models (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  brand VARCHAR(50) NOT NULL,
+  model VARCHAR(50) NOT NULL,
+  auto_answer_profile ENUM('both','callinfo','alertinfo','none') NOT NULL DEFAULT 'none',
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  UNIQUE KEY uq_brand_model (brand, model)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).then(() => {
+  // دادهٔ اولیه: مدل‌های رایج بازار
+  return pool.query(
+    `INSERT INTO phone_models (brand, model, auto_answer_profile) VALUES
+     ('Fanvil', 'X3S', 'both'), ('Fanvil', 'X3G', 'both'), ('Fanvil', 'X210', 'both'), ('Fanvil', 'X310', 'both'), ('Fanvil', 'X5S', 'both'),
+     ('Yealink', 'T30P', 'callinfo'), ('Yealink', 'T31P', 'callinfo'), ('Yealink', 'T43U', 'callinfo'), ('Yealink', 'T46S', 'callinfo'),
+     ('GrandStream', 'GXP2160', 'both'), ('GrandStream', 'GXP2130', 'both'), ('GrandStream', 'GXV3240', 'both'), ('GrandStream', 'GXP1620', 'both'),
+     ('ZTE', 'ZXV10', 'alertinfo'),
+     ('Alcatel', 'H2P', 'both'),
+     ('Generic', 'سایر / ناشناخته', 'none')
+     ON DUPLICATE KEY UPDATE auto_answer_profile = VALUES(auto_answer_profile)`
+  );
+}).catch(e => console.error('phone_models init:', e.message));
 
 // Middlewares
 app.use(helmet());
@@ -131,6 +164,19 @@ app.get('/api/numbers', async (req, res) => {
 app.get('/api/units', async (req, res) => {
   const [rows] = await pool.query("SELECT DISTINCT TRIM(vahed) as vahed FROM numbers WHERE TRIM(vahed) <> '' ORDER BY vahed ASC");
   res.json(rows.map(r => r.vahed));
+});
+
+// لیست مدل تلفن‌ها برای دراپ‌داون «مدل تلفن خود را انتخاب کنید»
+app.get('/api/phone-models', async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, brand, model FROM phone_models WHERE is_active = 1 ORDER BY brand ASC, model ASC"
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('phone-models error:', e.message);
+    res.status(500).json({ error: 'خطا در خواندن مدل‌های تلفن' });
+  }
 });
 
 app.use('/api/call', call(pool));

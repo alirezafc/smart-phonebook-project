@@ -28,7 +28,7 @@ export default function Admin(){
 
   if (authed !== true) return null
 
-  const logout = () => { try { localStorage.removeItem('token') } catch {} ; navigate('/login') }
+  const logout = () => { try { localStorage.removeItem('token') } catch {} ; navigate('/') }
 
   const menu = (extraClass = '') => (
     <nav className={extraClass}>

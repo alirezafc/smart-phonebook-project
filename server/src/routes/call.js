@@ -291,13 +291,26 @@ export default function callRouter(pool) {
             if (!session.origChannel && String(evt.calleridnum || '') === callerExtension) {
               session.origChannel = String(evt.channel || '');
             }
-          } else if (/^dial$/i.test(evName) && /^end$/i.test(String(evt.subevent || '')) && /^answer$/i.test(String(evt.dialstatus || ''))) {
-            if (session.status === 'ringing') {
-              session.status = 'connected';
-              console.log(`Call ${callId} [${callerExtension}->${exten}]: answered`);
+          } else if (/^dial$/i.test(evName) && /^end$/i.test(String(evt.subevent || ''))) {
+            const dialStatus = String(evt.dialstatus || '').toUpperCase();
+            if (dialStatus === 'ANSWER') {
+              if (session.status === 'ringing') {
+                session.status = 'connected';
+                session.connectedAt = Date.now();
+                console.log(`Call ${callId} [${callerExtension}->${exten}]: answered`);
+              }
+            } else if (['NOANSWER', 'BUSY', 'CANCEL', 'FAILED', 'CONGESTION', 'CHANUNAVAIL'].includes(dialStatus)) {
+              session.status = 'ended';
+              session.endedAt = Date.now();
+              session.endReason = dialStatus;
+              console.log(`Call ${callId} [${callerExtension}->${exten}]: not answered (${dialStatus})`);
             }
           } else if (/^hangup$/i.test(evName)) {
-            if (session.status !== 'connected') session.status = 'ended';
+            // قطع هر کدام از دو leg یعنی تماس تمام شد (حتی اگر قبلاً connected شده بود)
+            if (session.status !== 'ended' && session.status !== 'failed') {
+              session.status = 'ended';
+              session.endedAt = Date.now();
+            }
           }
         } catch {}
       };
@@ -338,15 +351,20 @@ export default function callRouter(pool) {
     }
   });
 
-  // وضعیت تماس برای بستن خودکار مدال در سمت مرورگر
-  router.get('/status/:callId', (req, res) => {
+// وضعیت تماس: کلاینت تا پایان تماس اینجا poll می‌زند و مدال باز می‌ماند
+router.get('/status/:callId', (req, res) => {
     const s = callSessions.get(String(req.params.callId || ''));
     if (!s) return res.json({ status: 'unknown' });
     if (s.ip !== normalizeIp(req.ip)) return res.status(403).json({ status: 'forbidden' });
-    res.json({ status: s.status, dialed: s.exten });
-    if (s.status === 'connected' || s.status === 'failed' || s.status === 'ended') {
-      s.cleanupAfter && s.cleanupAfter(15000);
-    }
+    // هر poll یعنی کلاینت هنوز منتظر است → زنده نگه‌داشتن نشست تا پایان تماس
+    s.cleanupAfter && s.cleanupAfter(3 * 60 * 1000);
+    res.json({
+      status: s.status,
+      dialed: s.exten,
+      connectedAt: s.connectedAt || null,
+      endedAt: s.endedAt || null,
+      endReason: s.endReason || ''
+    });
   });
 
   // لغو/قطع تماس توسط کاربر

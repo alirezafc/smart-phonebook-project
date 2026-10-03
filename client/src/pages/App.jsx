@@ -19,8 +19,6 @@ function readStorage(){
   return { status: 'unset', ext: '' }
 }
 
-function hasToken(){ try { return !!localStorage.getItem('token') } catch { return false } }
-
 export default function App(){
   const navigate = useNavigate()
   const [q, setQ] = useState('')
@@ -65,8 +63,8 @@ export default function App(){
         status={status}
         ext={ext}
         onOpenSettings={()=>setDialogOpen(true)}
-        onLogout={()=>{ localStorage.removeItem('token'); navigate('/login') }}
-        showAdmin={hasToken()}
+        onLogout={()=>{ localStorage.removeItem('token'); navigate('/') }}
+        showAdmin
       />
       <div className="max-w-6xl mx-auto p-4">
         <SearchBar value={q} onChange={setQ} units={units} unit={unit} onUnitChange={setUnit} />

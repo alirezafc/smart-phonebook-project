@@ -32,6 +32,9 @@ export default function Login(){
           <input type="password" className="w-full border rounded-xl p-2 mt-1" value={password} onChange={e=>setPassword(e.target.value)} />
         </label>
         <button className="w-full bg-slate-900 text-white rounded-xl py-2">ورود</button>
+        <button type="button" onClick={() => navigate('/')} className="mt-2 w-full border rounded-xl py-2 text-slate-600 hover:bg-slate-50">
+          صفحه اصلی (بدون ورود)
+        </button>
       </form>
     </div>
   )
